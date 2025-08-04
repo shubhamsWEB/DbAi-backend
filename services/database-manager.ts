@@ -3,6 +3,13 @@ const { Pool } = pkg;
 import mysql from 'mysql2/promise';
 import { detectDatabaseType, type DatabaseType } from './database-utils';
 import { storage } from '../storage';
+import { 
+  determineQueryTimeout, 
+  withTimeout, 
+  createQueryMetrics, 
+  logQueryMetrics,
+  type TimeoutConfig 
+} from './query-timeout-utils';
 
 interface DatabasePool {
   connectionId: string;
@@ -43,8 +50,9 @@ export class DatabaseManager {
       pool = new Pool({
         connectionString: connection.connectionUrl,
         max: 10,
-        idleTimeoutMillis: 30000,
-        connectionTimeoutMillis: 300000, // 5 minutes
+        idleTimeoutMillis: 30000, // 30 seconds idle timeout
+        connectionTimeoutMillis: 60000, // 60 seconds to establish connection
+        query_timeout: 60000, // 60 seconds for queries
       });
     }
 
@@ -71,7 +79,7 @@ export class DatabaseManager {
         const testPool = new Pool({
           connectionString: connectionUrl,
           max: 1,
-          connectionTimeoutMillis: 300000, // 5 minutes
+          connectionTimeoutMillis: 10000, // 10 seconds for connection test
         });
         const client = await testPool.connect();
         await client.query('SELECT 1');
@@ -85,13 +93,21 @@ export class DatabaseManager {
     }
   }
 
-  async executeQuery(connectionId: string, query: string, params: any[] = []): Promise<{ rows: any[], rowCount: number, executionTime: number }> {
+  async executeQuery(
+    connectionId: string, 
+    query: string, 
+    params: any[] = [], 
+    timeoutMs?: number // If not provided, will be auto-determined
+  ): Promise<{ rows: any[], rowCount: number, executionTime: number }> {
     const poolInfo = this.pools.get(connectionId);
     if (!poolInfo) {
       // Pool not in cache, get it (which will create it)
       await this.getPool(connectionId);
-      return this.executeQuery(connectionId, query, params);
+      return this.executeQuery(connectionId, query, params, timeoutMs);
     }
+
+    // Auto-determine timeout if not provided
+    const timeout = timeoutMs || determineQueryTimeout(query);
 
     // Validate parameters for MySQL - it doesn't allow undefined values
     if (poolInfo.type === 'mysql') {
@@ -102,35 +118,64 @@ export class DatabaseManager {
     }
 
     const startTime = Date.now();
+    let isTimeout = false;
     
     try {
-      if (poolInfo.type === 'mysql') {
-        const pool = poolInfo.pool as mysql.Pool;
-        const [rows] = await pool.execute(query, params);
-        const executionTime = Date.now() - startTime;
-        
-        return {
-          rows: Array.isArray(rows) ? rows : [],
-          rowCount: Array.isArray(rows) ? rows.length : 0,
-          executionTime
-        };
-      } else {
-        const pool = poolInfo.pool as InstanceType<typeof Pool>;
-        const result = await pool.query(query, params);
-        const executionTime = Date.now() - startTime;
-        
-        return {
-          rows: result.rows,
-          rowCount: result.rowCount || 0,
-          executionTime
-        };
-      }
+      // Execute the query with timeout protection using utility function
+      const queryPromise = this.executeQueryInternal(poolInfo, query, params);
+      const result = await withTimeout(
+        queryPromise, 
+        timeout, 
+        `Query timed out after ${timeout}ms. Consider optimizing your query or increasing the timeout.`
+      );
+      
+      const executionTime = Date.now() - startTime;
+      
+      // Log performance metrics
+      const metrics = createQueryMetrics(executionTime, timeout, query, false);
+      logQueryMetrics(connectionId, query, metrics);
+      
+      return {
+        ...result,
+        executionTime
+      };
     } catch (error: any) {
       const executionTime = Date.now() - startTime;
-      console.error('Query execution failed:', error);
-      console.error('Query:', query);
-      console.error('Parameters:', params);
+      isTimeout = error.message?.includes('timeout') || error.message?.includes('timed out');
+      
+      // Log performance metrics with error information
+      const metrics = createQueryMetrics(executionTime, timeout, query, isTimeout);
+      logQueryMetrics(connectionId, query, metrics);
+      
+      if (isTimeout) {
+        throw new Error(`Query timed out after ${timeout}ms. Consider optimizing your query or increasing the timeout.`);
+      }
+      
       throw new Error(`Query failed: ${error.message}`);
+    }
+  }
+
+  private async executeQueryInternal(
+    poolInfo: DatabasePool, 
+    query: string, 
+    params: any[]
+  ): Promise<{ rows: any[], rowCount: number }> {
+    if (poolInfo.type === 'mysql') {
+      const pool = poolInfo.pool as mysql.Pool;
+      const [rows] = await pool.execute(query, params);
+      
+      return {
+        rows: Array.isArray(rows) ? rows : [],
+        rowCount: Array.isArray(rows) ? rows.length : 0
+      };
+    } else {
+      const pool = poolInfo.pool as InstanceType<typeof Pool>;
+      const result = await pool.query(query, params);
+      
+      return {
+        rows: result.rows,
+        rowCount: result.rowCount || 0
+      };
     }
   }
 

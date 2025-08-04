@@ -9,6 +9,8 @@ import { groqQueryGenerator } from "./services/groq-query-generator";
 import { insertDatabaseConnectionSchema, insertChatMessageSchema } from "@shared/schema";
 import { fromZodError } from "zod-validation-error";
 
+// Note: Query timeout determination is now handled automatically in DatabaseManager
+
 export async function registerRoutes(app: Express): Promise<Server> {
   const httpServer = createServer(app);
 
@@ -255,11 +257,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
         message: 'Executing query...'
       }));
 
-      // Execute the query
+      // Execute the query (timeout is automatically determined by DatabaseManager)
       const startTime = Date.now();
       const executionResult = await databaseManager.executeQuery(
         connectionId, 
-        queryResult.sqlQuery
+        queryResult.sqlQuery,
+        [] // no parameters
       );
       const executionTime = Date.now() - startTime;
 
@@ -375,11 +378,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
         message: 'Executing query...'
       }));
 
-      // Execute the query
+      // Execute the query (timeout is automatically determined by DatabaseManager)
       const startTime = Date.now();
       const executionResult = await databaseManager.executeQuery(
         connectionId, 
-        queryResult.sqlQuery
+        queryResult.sqlQuery,
+        [] // no parameters
       );
       const executionTime = Date.now() - startTime;
 

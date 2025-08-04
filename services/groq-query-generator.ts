@@ -53,7 +53,7 @@ Respond with JSON in this format:
 
     try {
       const response = await groq.chat.completions.create({
-        model: "llama-3.3-70b-versatile", // Higher context window and better performance
+        model: "moonshotai/kimi-k2-instruct", // Higher context window and better performance
         messages: [
           {
             role: "system",
@@ -144,7 +144,7 @@ Respond with JSON:
 
     try {
       const response = await groq.chat.completions.create({
-        model: "llama-3.3-70b-versatile",
+        model: "llama-3.1-8b-instant",
         messages: [
           {
             role: "system",
@@ -203,7 +203,7 @@ Respond with JSON:
 
     try {
       const response = await groq.chat.completions.create({
-        model: "llama-3.3-70b-versatile",
+        model: "llama-3.1-8b-instant",
         messages: [
           {
             role: "system",
