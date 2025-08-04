@@ -28,7 +28,8 @@
     "pg": "^8.16.3",
     "ws": "^8.18.0",
     "zod": "^3.24.2",
-    "zod-validation-error": "^3.4.0"
+    "zod-validation-error": "^3.4.0",
+    "mysql2": "^3.6.5"
   },
   "devDependencies": {
     "@types/connect-pg-simple": "^7.0.3",

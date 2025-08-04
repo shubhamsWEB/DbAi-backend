@@ -1,5 +1,6 @@
 import Groq from "groq-sdk";
 import { schemaIntrospector, type DatabaseSchemaInfo } from './schema-introspector';
+import { databaseManager } from './database-manager';
 
 // Initialize Groq client with the provided API key
 const groq = new Groq({ 
@@ -20,22 +21,27 @@ export class GroqQueryGenerator {
       throw new Error('Database schema not available. Please introspect the database first.');
     }
 
+    const dbType = await databaseManager.getDatabaseType(connectionId);
+    const dbName = dbType === 'mysql' ? 'MySQL' : 'PostgreSQL';
+    const quotingStyle = dbType === 'mysql' ? 'backticks (`)' : 'double quotes (")';
+
     const schemaDescription = this.buildSchemaDescription(schema);
     
-    const prompt = `You are an expert PostgreSQL query generator. Given a database schema and a user question, generate an accurate SQL query.
+    const prompt = `You are an expert ${dbName} query generator. Given a database schema and a user question, generate an accurate SQL query.
 
 DATABASE SCHEMA:
 ${schemaDescription}
 
 USER QUESTION: ${userQuestion}
 
-Generate a PostgreSQL query that answers the user's question. Consider:
+Generate a ${dbName} query that answers the user's question. Consider:
 1. Use proper JOIN syntax when relationships are needed
 2. Include appropriate WHERE clauses for filtering
 3. Use aggregate functions when summarizing data
 4. Add ORDER BY clauses for better result organization
 5. Limit results if the query might return too many rows (use LIMIT)
 6. Use proper column aliases for readability
+7. Use ${quotingStyle} for table/column names with spaces or reserved words
 
 Respond with JSON in this format:
 {
@@ -47,7 +53,7 @@ Respond with JSON in this format:
 
     try {
       const response = await groq.chat.completions.create({
-        model: "llama-3.3-70b-versatile",
+        model: "llama-3.3-70b-versatile", // Higher context window and better performance
         messages: [
           {
             role: "system",
@@ -77,20 +83,29 @@ Respond with JSON in this format:
   }
 
   private buildSchemaDescription(schema: DatabaseSchemaInfo): string {
-    let description = `Database contains ${schema.totalTables} tables:\n\n`;
+    let description = `Database: ${schema.totalTables} tables\n\n`;
     
     for (const table of schema.tables) {
-      description += `TABLE: ${table.name} (${table.rowCount} rows)\n`;
+      description += `${table.name}(${table.rowCount}):\n`;
       
-      for (const column of table.columns) {
-        const constraints = [];
-        if (column.isPrimaryKey) constraints.push('PRIMARY KEY');
-        if (!column.isNullable) constraints.push('NOT NULL');
-        if (column.defaultValue) constraints.push(`DEFAULT ${column.defaultValue}`);
-        
-        const constraintStr = constraints.length > 0 ? ` (${constraints.join(', ')})` : '';
-        description += `  - ${column.name}: ${column.type}${constraintStr}\n`;
+      // Group columns by type to reduce verbosity
+      const pkColumns = table.columns.filter(c => c.isPrimaryKey).map(c => c.name);
+      const regularColumns = table.columns.filter(c => !c.isPrimaryKey);
+      
+      if (pkColumns.length > 0) {
+        description += `  PK: ${pkColumns.join(', ')}\n`;
       }
+      
+      // Simplified column description - only essential info
+      for (const column of regularColumns.slice(0, 10)) { // Limit to first 10 columns
+        const nullInfo = column.isNullable ? '' : ' NOT NULL';
+        description += `  ${column.name}: ${column.type}${nullInfo}\n`;
+      }
+      
+      if (regularColumns.length > 10) {
+        description += `  ... and ${regularColumns.length - 10} more columns\n`;
+      }
+      
       description += '\n';
     }
     
@@ -103,7 +118,10 @@ Respond with JSON in this format:
       return { optimizedQuery: originalQuery, improvements: [] };
     }
 
-    const prompt = `Analyze and optimize this PostgreSQL query for better performance:
+    const dbType = await databaseManager.getDatabaseType(connectionId);
+    const dbName = dbType === 'mysql' ? 'MySQL' : 'PostgreSQL';
+
+    const prompt = `Analyze and optimize this ${dbName} query for better performance:
 
 QUERY:
 ${originalQuery}
@@ -130,7 +148,7 @@ Respond with JSON:
         messages: [
           {
             role: "system",
-            content: "You are a PostgreSQL performance optimization expert. Always respond with valid JSON."
+            content: `You are a ${dbName} performance optimization expert. Always respond with valid JSON.`
           },
           {
             role: "user",
@@ -159,7 +177,10 @@ Respond with JSON:
       throw new Error('Database schema not available. Please introspect the database first.');
     }
 
-    const prompt = `Analyze and explain this PostgreSQL query in detail:
+    const dbType = await databaseManager.getDatabaseType(connectionId);
+    const dbName = dbType === 'mysql' ? 'MySQL' : 'PostgreSQL';
+
+    const prompt = `Analyze and explain this ${dbName} query in detail:
 
 QUERY:
 ${sqlQuery}
@@ -182,11 +203,11 @@ Respond with JSON:
 
     try {
       const response = await groq.chat.completions.create({
-        model: "llama-3.1-8b-instant",
+        model: "llama-3.3-70b-versatile",
         messages: [
           {
             role: "system",
-            content: "You are a PostgreSQL expert who explains queries clearly and provides performance insights. Always respond with valid JSON."
+            content: `You are a ${dbName} expert who explains queries clearly and provides performance insights. Always respond with valid JSON.`
           },
           {
             role: "user",
@@ -217,39 +238,18 @@ Respond with JSON:
     connectionId: string
   ): Promise<{ summary: string; insights: string[] }> {
     const schema = await schemaIntrospector.getCachedSchema(connectionId);
-    const schemaDescription = schema ? this.buildSchemaDescription(schema) : 'Schema not available';
-
-    // Convert query results to a readable format
-    const resultsText = this.formatQueryResultsForSummarization(queryResults);
     
-    const prompt = `You are an expert data analyst. Analyze the SQL query results and provide a natural language summary based on the user's original question.
-
-USER'S ORIGINAL QUESTION: ${originalUserQuery}
-
-SQL QUERY EXECUTED:
-${sqlQuery}
-
-DATABASE SCHEMA:
-${schemaDescription}
-
-QUERY RESULTS:
-${resultsText}
-
-Please provide a comprehensive analysis that includes:
-1. A natural language summary answering the user's question
-2. Key insights and patterns from the data
-3. Notable trends or anomalies
-4. Practical implications of the findings
-
-Respond with JSON in this format:
-{
-  "summary": "A clear, natural language answer to the user's question based on the data",
-  "insights": ["Key insight 1", "Key insight 2", "Key insight 3"]
-}`;
-
+    // Build the prompt with intelligent truncation to stay within token limits
+    const { truncatedPrompt } = this.buildTruncatedSummarizationPrompt(
+      originalUserQuery,
+      sqlQuery,
+      queryResults,
+      schema
+    );
+    
     try {
       const response = await groq.chat.completions.create({
-        model: "moonshotai/kimi-k2-instruct", // Using Kimi K2 for largest context window (131K tokens)
+        model: "moonshotai/kimi-k2-instruct", // Better performance and higher context window
         messages: [
           {
             role: "system",
@@ -257,7 +257,7 @@ Respond with JSON in this format:
           },
           {
             role: "user",
-            content: prompt
+            content: truncatedPrompt
           }
         ],
         response_format: { type: "json_object" },
@@ -274,6 +274,190 @@ Respond with JSON in this format:
       console.error('Groq summarization failed:', error);
       throw new Error(`Failed to summarize query results with Groq: ${error.message}`);
     }
+  }
+
+  private buildTruncatedSummarizationPrompt(
+    originalUserQuery: string,
+    sqlQuery: string,
+    queryResults: { rows: any[]; rowCount: number },
+    schema: DatabaseSchemaInfo | null
+  ): { truncatedPrompt: string; tokenEstimate: number } {
+    // Target token limit with safety margin (aim for ~8500 to leave room for system message and response)
+    const TARGET_TOKEN_LIMIT = 8500;
+    
+    // Rough estimation: 1 token ≈ 4 characters
+    const estimateTokens = (text: string) => Math.ceil(text.length / 4);
+    
+    // Build base prompt structure
+    const basePrompt = `You are an expert data analyst. Analyze the SQL query results and provide a natural language summary based on the user's original question.
+
+USER'S ORIGINAL QUESTION: ${originalUserQuery}
+
+SQL QUERY EXECUTED:
+${sqlQuery}
+
+DATABASE SCHEMA:
+{SCHEMA_PLACEHOLDER}
+
+QUERY RESULTS:
+{RESULTS_PLACEHOLDER}
+
+Please provide a comprehensive analysis that includes:
+1. A natural language summary answering the user's question
+2. Key insights and patterns from the data
+3. Notable trends or anomalies
+4. Practical implications of the findings
+
+Respond with JSON in this format:
+{
+  "summary": "A clear, natural language answer to the user's question based on the data",
+  "insights": ["Key insight 1", "Key insight 2", "Key insight 3"]
+}`;
+
+    // Calculate base tokens (everything except schema and results)
+    const baseTokens = estimateTokens(basePrompt.replace('{SCHEMA_PLACEHOLDER}', '').replace('{RESULTS_PLACEHOLDER}', ''));
+    let remainingTokens = TARGET_TOKEN_LIMIT - baseTokens;
+    
+    // Generate schema description with progressive truncation
+    let schemaDescription = 'Schema not available';
+    if (schema) {
+      schemaDescription = this.buildTruncatedSchemaDescription(schema, Math.floor(remainingTokens * 0.3)); // Allocate 30% to schema
+    }
+    
+    // Calculate remaining tokens after schema
+    const schemaTokens = estimateTokens(schemaDescription);
+    remainingTokens = remainingTokens - schemaTokens;
+    
+    // Generate results text with remaining tokens
+    const resultsText = this.formatQueryResultsForSummarizationWithLimit(queryResults, remainingTokens);
+    
+    // Build final prompt
+    const finalPrompt = basePrompt
+      .replace('{SCHEMA_PLACEHOLDER}', schemaDescription)
+      .replace('{RESULTS_PLACEHOLDER}', resultsText);
+    
+    const finalTokenEstimate = estimateTokens(finalPrompt);
+    
+    return {
+      truncatedPrompt: finalPrompt,
+      tokenEstimate: finalTokenEstimate
+    };
+  }
+
+  private buildTruncatedSchemaDescription(schema: DatabaseSchemaInfo, maxTokens: number): string {
+    const estimateTokens = (text: string) => Math.ceil(text.length / 4);
+    
+    let description = `Database: ${schema.totalTables} tables\n\n`;
+    let currentTokens = estimateTokens(description);
+    
+    // Sort tables by row count (prioritize tables with more data)
+    const sortedTables = [...schema.tables].sort((a, b) => (b.rowCount || 0) - (a.rowCount || 0));
+    
+    for (let i = 0; i < sortedTables.length; i++) {
+      const table = sortedTables[i];
+      
+      // Build table description progressively
+      let tableDesc = `${table.name}(${table.rowCount}):\n`;
+      
+      // Add primary keys
+      const pkColumns = table.columns.filter(c => c.isPrimaryKey).map(c => c.name);
+      if (pkColumns.length > 0) {
+        tableDesc += `  PK: ${pkColumns.join(', ')}\n`;
+      }
+      
+      // Add regular columns (limit based on remaining tokens)
+      const regularColumns = table.columns.filter(c => !c.isPrimaryKey);
+      const tokensForTable = Math.floor((maxTokens - currentTokens) / (sortedTables.length - i));
+      
+      let columnsAdded = 0;
+      const maxColumns = Math.min(regularColumns.length, Math.max(3, Math.floor(tokensForTable / 10))); // At least 3 columns if possible
+      
+      for (const column of regularColumns.slice(0, maxColumns)) {
+        const columnDesc = `  ${column.name}: ${column.type}${column.isNullable ? '' : ' NOT NULL'}\n`;
+        if (estimateTokens(tableDesc + columnDesc) + currentTokens > maxTokens) break;
+        
+        tableDesc += columnDesc;
+        columnsAdded++;
+      }
+      
+      if (regularColumns.length > columnsAdded) {
+        tableDesc += `  ... and ${regularColumns.length - columnsAdded} more columns\n`;
+      }
+      
+      tableDesc += '\n';
+      
+      // Check if adding this table would exceed token limit
+      if (currentTokens + estimateTokens(tableDesc) > maxTokens) {
+        const remainingTables = sortedTables.length - i;
+        if (remainingTables > 0) {
+          description += `... and ${remainingTables} more tables\n`;
+        }
+        break;
+      }
+      
+      description += tableDesc;
+      currentTokens += estimateTokens(tableDesc);
+    }
+    
+    return description;
+  }
+
+  private formatQueryResultsForSummarizationWithLimit(
+    queryResults: { rows: any[]; rowCount: number },
+    maxTokens: number
+  ): string {
+    const estimateTokens = (text: string) => Math.ceil(text.length / 4);
+    const { rows, rowCount } = queryResults;
+    
+    if (rowCount === 0) {
+      return "No data returned from the query.";
+    }
+
+    let resultsText = `Total rows returned: ${rowCount}\n\n`;
+    let currentTokens = estimateTokens(resultsText);
+    
+    if (rows.length > 0) {
+      // Add column information
+      const columns = Object.keys(rows[0]);
+      const columnsText = `Columns: ${columns.join(', ')}\n\n`;
+      
+      if (currentTokens + estimateTokens(columnsText) < maxTokens) {
+        resultsText += columnsText;
+        currentTokens += estimateTokens(columnsText);
+      }
+      
+      // Add sample data with dynamic row limiting based on available tokens
+      resultsText += "Sample data:\n";
+      currentTokens += estimateTokens("Sample data:\n");
+      
+      let rowsAdded = 0;
+      const maxRows = Math.min(rows.length, 5); // Start with max 5 rows, reduce if needed
+      
+      for (let i = 0; i < maxRows; i++) {
+        const rowText = `Row ${i + 1}: ${JSON.stringify(rows[i])}\n`;
+        const rowTokens = estimateTokens(rowText);
+        
+        if (currentTokens + rowTokens > maxTokens * 0.8) { // Use 80% of remaining space for data
+          break;
+        }
+        
+        resultsText += rowText;
+        currentTokens += rowTokens;
+        rowsAdded++;
+      }
+      
+      if (rows.length > rowsAdded) {
+        resultsText += `... and ${rows.length - rowsAdded} more rows\n`;
+      }
+      
+      // Add basic statistics if there's still room
+      const statsText = this.generateBasicStatistics(rows, columns);
+      if (currentTokens + estimateTokens(statsText) < maxTokens) {
+        resultsText += statsText;
+      }
+    }
+    
+    return resultsText;
   }
 
   private formatQueryResultsForSummarization(queryResults: { rows: any[]; rowCount: number }): string {

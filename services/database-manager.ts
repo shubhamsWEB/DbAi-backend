@@ -1,10 +1,13 @@
 import pkg from 'pg';
 const { Pool } = pkg;
+import mysql from 'mysql2/promise';
+import { detectDatabaseType, type DatabaseType } from './database-utils';
 import { storage } from '../storage';
 
 interface DatabasePool {
   connectionId: string;
-  pool: InstanceType<typeof Pool>;
+  pool: InstanceType<typeof Pool> | mysql.Pool;
+  type: DatabaseType;
   lastUsed: Date;
 }
 
@@ -14,10 +17,10 @@ export class DatabaseManager {
 
   constructor() {
     // Clean up idle connections every 10 minutes
-    setInterval(() => this.cleanupIdleConnections(), 10 * 60 * 1000);
+    setInterval(() => this.cleanupIdleConnections().catch(console.error), 10 * 60 * 1000);
   }
 
-  async getPool(connectionId: string): Promise<InstanceType<typeof Pool>> {
+  async getPool(connectionId: string): Promise<InstanceType<typeof Pool> | mysql.Pool> {
     let poolInfo = this.pools.get(connectionId);
     
     if (poolInfo) {
@@ -31,16 +34,24 @@ export class DatabaseManager {
       throw new Error(`Database connection not found: ${connectionId}`);
     }
 
-    const pool = new Pool({
-      connectionString: connection.connectionUrl,
-      max: 10,
-      idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 300000, // 5 minutes
-    });
+    const dbType = detectDatabaseType(connection.connectionUrl);
+    let pool: InstanceType<typeof Pool> | mysql.Pool;
+
+    if (dbType === 'mysql') {
+      pool = mysql.createPool(connection.connectionUrl);
+    } else {
+      pool = new Pool({
+        connectionString: connection.connectionUrl,
+        max: 10,
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 300000, // 5 minutes
+      });
+    }
 
     poolInfo = {
       connectionId,
       pool,
+      type: dbType,
       lastUsed: new Date()
     };
 
@@ -49,53 +60,97 @@ export class DatabaseManager {
   }
 
   async testConnection(connectionUrl: string): Promise<boolean> {
-    const testPool = new Pool({
-      connectionString: connectionUrl,
-      max: 1,
-      connectionTimeoutMillis: 300000, // 5 minutes
-    });
-
+    const dbType = detectDatabaseType(connectionUrl);
+    
     try {
-      const client = await testPool.connect();
-      await client.query('SELECT 1');
-      client.release();
+      if (dbType === 'mysql') {
+        const connection = await mysql.createConnection(connectionUrl);
+        await connection.execute('SELECT 1');
+        await connection.end();
+      } else {
+        const testPool = new Pool({
+          connectionString: connectionUrl,
+          max: 1,
+          connectionTimeoutMillis: 300000, // 5 minutes
+        });
+        const client = await testPool.connect();
+        await client.query('SELECT 1');
+        client.release();
+        await testPool.end();
+      }
       return true;
     } catch (error) {
       console.error('Database connection test failed:', error);
       return false;
-    } finally {
-      await testPool.end();
     }
   }
 
   async executeQuery(connectionId: string, query: string, params: any[] = []): Promise<{ rows: any[], rowCount: number, executionTime: number }> {
-    const pool = await this.getPool(connectionId);
+    const poolInfo = this.pools.get(connectionId);
+    if (!poolInfo) {
+      // Pool not in cache, get it (which will create it)
+      await this.getPool(connectionId);
+      return this.executeQuery(connectionId, query, params);
+    }
+
+    // Validate parameters for MySQL - it doesn't allow undefined values
+    if (poolInfo.type === 'mysql') {
+      const hasUndefined = params.some(param => param === undefined);
+      if (hasUndefined) {
+        throw new Error(`MySQL queries cannot contain undefined parameters. Received: ${JSON.stringify(params)}`);
+      }
+    }
+
     const startTime = Date.now();
     
     try {
-      const result = await pool.query(query, params);
-      const executionTime = Date.now() - startTime;
-      
-      return {
-        rows: result.rows,
-        rowCount: result.rowCount || 0,
-        executionTime
-      };
+      if (poolInfo.type === 'mysql') {
+        const pool = poolInfo.pool as mysql.Pool;
+        const [rows] = await pool.execute(query, params);
+        const executionTime = Date.now() - startTime;
+        
+        return {
+          rows: Array.isArray(rows) ? rows : [],
+          rowCount: Array.isArray(rows) ? rows.length : 0,
+          executionTime
+        };
+      } else {
+        const pool = poolInfo.pool as InstanceType<typeof Pool>;
+        const result = await pool.query(query, params);
+        const executionTime = Date.now() - startTime;
+        
+        return {
+          rows: result.rows,
+          rowCount: result.rowCount || 0,
+          executionTime
+        };
+      }
     } catch (error: any) {
       const executionTime = Date.now() - startTime;
       console.error('Query execution failed:', error);
+      console.error('Query:', query);
+      console.error('Parameters:', params);
       throw new Error(`Query failed: ${error.message}`);
     }
   }
 
-  private cleanupIdleConnections(): void {
+  private async cleanupIdleConnections(): Promise<void> {
     const now = new Date();
     
     for (const [connectionId, poolInfo] of Array.from(this.pools.entries())) {
       const idleTime = now.getTime() - poolInfo.lastUsed.getTime();
       
       if (idleTime > this.maxIdleTime) {
-        poolInfo.pool.end().catch(console.error);
+        try {
+          if (poolInfo.type === 'mysql') {
+            await (poolInfo.pool as mysql.Pool).end();
+          } else {
+            await (poolInfo.pool as InstanceType<typeof Pool>).end();
+          }
+        } catch (error) {
+          console.error(`Error closing pool for ${connectionId}:`, error);
+        }
+        
         this.pools.delete(connectionId);
         console.log(`Cleaned up idle connection: ${connectionId}`);
       }
@@ -105,15 +160,41 @@ export class DatabaseManager {
   async closeConnection(connectionId: string): Promise<void> {
     const poolInfo = this.pools.get(connectionId);
     if (poolInfo) {
-      await poolInfo.pool.end();
+      if (poolInfo.type === 'mysql') {
+        await (poolInfo.pool as mysql.Pool).end();
+      } else {
+        await (poolInfo.pool as InstanceType<typeof Pool>).end();
+      }
       this.pools.delete(connectionId);
     }
   }
 
   async closeAllConnections(): Promise<void> {
-    const closePromises = Array.from(this.pools.values()).map(poolInfo => poolInfo.pool.end());
+    const closePromises = Array.from(this.pools.values()).map(async poolInfo => {
+      if (poolInfo.type === 'mysql') {
+        return (poolInfo.pool as mysql.Pool).end();
+      } else {
+        return (poolInfo.pool as InstanceType<typeof Pool>).end();
+      }
+    });
+    
     await Promise.all(closePromises);
     this.pools.clear();
+  }
+
+  // Helper method to get database type for a connection
+  async getDatabaseType(connectionId: string): Promise<DatabaseType> {
+    const poolInfo = this.pools.get(connectionId);
+    if (poolInfo) {
+      return poolInfo.type;
+    }
+    
+    const connection = await storage.getDatabaseConnection(connectionId);
+    if (!connection) {
+      throw new Error(`Database connection not found: ${connectionId}`);
+    }
+    
+    return detectDatabaseType(connection.connectionUrl);
   }
 }
 

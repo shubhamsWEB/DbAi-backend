@@ -1,5 +1,6 @@
 import OpenAI from "openai";
 import { schemaIntrospector, type DatabaseSchemaInfo } from './schema-introspector';
+import { databaseManager } from './database-manager';
 
 // the newest OpenAI model is "gpt-4o" which was released May 13, 2024. do not change this unless explicitly requested by the user
 const openai = new OpenAI({ 
@@ -20,22 +21,27 @@ export class AIQueryGenerator {
       throw new Error('Database schema not available. Please introspect the database first.');
     }
 
+    const dbType = await databaseManager.getDatabaseType(connectionId);
+    const dbName = dbType === 'mysql' ? 'MySQL' : 'PostgreSQL';
+    const quotingStyle = dbType === 'mysql' ? 'backticks (`)' : 'double quotes (")';
+
     const schemaDescription = this.buildSchemaDescription(schema);
     
-    const prompt = `You are an expert PostgreSQL query generator. Given a database schema and a user question, generate an accurate SQL query.
+    const prompt = `You are an expert ${dbName} query generator. Given a database schema and a user question, generate an accurate SQL query.
 
 DATABASE SCHEMA:
 ${schemaDescription}
 
 USER QUESTION: ${userQuestion}
 
-Generate a PostgreSQL query that answers the user's question. Consider:
+Generate a ${dbName} query that answers the user's question. Consider:
 1. Use proper JOIN syntax when relationships are needed
 2. Include appropriate WHERE clauses for filtering
 3. Use aggregate functions when summarizing data
 4. Add ORDER BY clauses for better result organization
 5. Limit results if the query might return too many rows (use LIMIT)
 6. Use proper column aliases for readability
+7. Use ${quotingStyle} for table/column names with spaces or reserved words
 
 Respond with JSON in this format:
 {
@@ -51,7 +57,7 @@ Respond with JSON in this format:
         messages: [
           {
             role: "system",
-            content: "You are an expert SQL query generator. Always respond with valid JSON containing sqlQuery, explanation, confidence, and optional warnings fields."
+            content: `You are an expert SQL query generator for ${dbName} databases. Always respond with valid JSON containing sqlQuery, explanation, confidence, and optional warnings fields.`
           },
           {
             role: "user",
@@ -103,7 +109,10 @@ Respond with JSON in this format:
       return { optimizedQuery: originalQuery, improvements: [] };
     }
 
-    const prompt = `Analyze and optimize this PostgreSQL query for better performance:
+    const dbType = await databaseManager.getDatabaseType(connectionId);
+    const dbName = dbType === 'mysql' ? 'MySQL' : 'PostgreSQL';
+
+    const prompt = `Analyze and optimize this ${dbName} query for better performance:
 
 QUERY:
 ${originalQuery}
@@ -130,7 +139,7 @@ Respond with JSON:
         messages: [
           {
             role: "system",
-            content: "You are a PostgreSQL performance optimization expert. Always respond with valid JSON."
+            content: `You are a ${dbName} performance optimization expert. Always respond with valid JSON.`
           },
           {
             role: "user",
