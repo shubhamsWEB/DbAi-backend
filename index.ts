@@ -5,9 +5,10 @@ import cors from "cors";
 
 const app = express();
 
-// Enable CORS for frontend communication
+// Enable CORS for frontend communication (allowing all origins for testing)
 app.use(cors({
-  origin: process.env.FRONTEND_URL || "http://localhost:3000",
+  // origin: process.env.FRONTEND_URL || "http://localhost:3000",
+  origin: true, // Allow all origins for testing
   credentials: true
 }));
 
