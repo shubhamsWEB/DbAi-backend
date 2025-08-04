@@ -20,8 +20,8 @@ export interface TimeoutConfig {
 // Default timeout configuration (in milliseconds)
 export const DEFAULT_TIMEOUT_CONFIG: TimeoutConfig = {
   default: 30000,    // 30 seconds for default queries
-  simple: 15000,     // 15 seconds for simple SELECT queries
-  complex: 120000,   // 2 minutes for complex queries with JOINs, GROUP BY, etc.
+  simple: 300000,     // 15 seconds for simple SELECT queries
+  complex: 300000,   // 2 minutes for complex queries with JOINs, GROUP BY, etc.
   ddl: 300000,       // 5 minutes for DDL operations (CREATE INDEX, ALTER TABLE)
   longRunning: 600000 // 10 minutes for analytics/reporting queries
 };
