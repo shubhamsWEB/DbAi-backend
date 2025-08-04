@@ -50,9 +50,9 @@ export class DatabaseManager {
       pool = new Pool({
         connectionString: connection.connectionUrl,
         max: 10,
-        idleTimeoutMillis: 30000, // 30 seconds idle timeout
-        connectionTimeoutMillis: 60000, // 60 seconds to establish connection
-        query_timeout: 60000, // 60 seconds for queries
+        idleTimeoutMillis: 300000, // 5 minutes idle timeout
+        connectionTimeoutMillis: 120000, // 2 minutes to establish connection
+        query_timeout: 600000, // 10 minutes for queries
       });
     }
 
@@ -79,7 +79,7 @@ export class DatabaseManager {
         const testPool = new Pool({
           connectionString: connectionUrl,
           max: 1,
-          connectionTimeoutMillis: 10000, // 10 seconds for connection test
+          connectionTimeoutMillis: 30000, // 30 seconds for connection test
         });
         const client = await testPool.connect();
         await client.query('SELECT 1');
